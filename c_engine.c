@@ -30,8 +30,8 @@ ssize_t read_n(int fd, void* buf, size_t n) {
     while (got < n) {
         ssize_t r = read(fd, (char*)buf + got, n - got);
         if (r == 0) return 0;
-        if (r < 0) { if (errno == EINTR) continue; perror("read"); return -1; }
-        got += r;
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        got += (size_t)r;
     }
     return (ssize_t)got;
 }
@@ -39,9 +39,9 @@ ssize_t read_n(int fd, void* buf, size_t n) {
 int write_all(int fd, const void* buf, size_t n) {
     size_t sent = 0;
     while (sent < n) {
-        ssize_t w = write(fd, (const char*)buf + sent, n - sent);
-        if (w < 0) { if (errno == EINTR) continue; perror("write"); return -1; }
-        sent += (size_t)w;
+        ssize_t r = write(fd, (const char*)buf + sent, n - sent);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        sent += (size_t)r;
     }
     return 0;
 }
@@ -57,6 +57,10 @@ int send_frame(int fd, uint8_t op, const void* payload, uint32_t len) {
 }
 
 void handle_connection(int cfd) {
+    // per-connection upload state
+    FILE* upload_fp = NULL;
+    char upload_name[256] = {0};
+
     for (;;) {
         uint8_t header[5];
         ssize_t r = read_n(cfd, header, 5);
@@ -76,21 +80,72 @@ void handle_connection(int cfd) {
         if (op == OP_UPLOAD_START) {
             printf("[ENGINE] UPLOAD_START: name=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
-            // TODO: initialize upload state
+            // --- initialize upload state ---
+            // close previous upload if still open
+            if (upload_fp) {
+                fclose(upload_fp);
+                upload_fp = NULL;
+            }
+
+            // store file name (CID = file name in this simple implementation)
+            size_t name_len = len < sizeof(upload_name) - 1 ? len : sizeof(upload_name) - 1;
+            memcpy(upload_name, payload, name_len);
+            upload_name[name_len] = '\0';
+
+            // open file for writing in current directory
+            upload_fp = fopen(upload_name, "wb");
+            if (!upload_fp) {
+                perror("fopen upload");
+                break;
+            }
         } else if (op == OP_UPLOAD_CHUNK) {
-            // TODO: process chunk (hash/store); here just drop
+            // --- process chunk: write to file on disk ---
+            if (upload_fp && len > 0) {
+                size_t written = fwrite(payload, 1, len, upload_fp);
+                if (written != len) {
+                    perror("fwrite upload chunk");
+                    break;
+                }
+            }
         } else if (op == OP_UPLOAD_FINISH) {
-            // TODO: finalize DAG and compute real CID
-            const char* cid = "CID-PLACEHOLDER";
+            // --- finalize upload: close file and compute CID (here: file name) ---
+            if (upload_fp) {
+                fclose(upload_fp);
+                upload_fp = NULL;
+            }
+
+            const char* cid = upload_name[0] ? upload_name : "CID-EMPTY";
             printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
             fflush(stdout);
             send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
         } else if (op == OP_DOWNLOAD_START) {
             printf("[ENGINE] DOWNLOAD_START: cid=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
-            // TODO: look up CID, stream verified chunks
-            // Minimal placeholder: no chunks, just DONE
-            send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+            // --- look up CID and stream file chunks ---
+            char cid_buf[256];
+            size_t cid_len = len < sizeof(cid_buf) - 1 ? len : sizeof(cid_buf) - 1;
+            memcpy(cid_buf, payload, cid_len);
+            cid_buf[cid_len] = '\0';
+
+            // In this simple implementation, CID is just the file name
+            FILE* f = fopen(cid_buf, "rb");
+            if (!f) {
+                perror("fopen download");
+                // If file is not found, just signal DONE with no data
+                send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+            } else {
+                uint8_t buf[256 * 1024];
+                size_t read_bytes;
+                while ((read_bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
+                    if (send_frame(cfd, OP_DOWNLOAD_CHUNK, buf, (uint32_t)read_bytes) < 0) {
+                        perror("send_frame download chunk");
+                        break;
+                    }
+                }
+                fclose(f);
+                // signal end of download
+                send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+            }
         } else {
         }
 
@@ -115,9 +170,10 @@ int main(int argc, char** argv) {
     strncpy(addr.sun_path, g_sock_path, sizeof(addr.sun_path) - 1);
     unlink(g_sock_path);
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return 2; }
-    if (listen(fd, 64) < 0) { perror("listen"); return 2; }
 
-    printf("[ENGINE] listening on %s\n", g_sock_path);
+    if (listen(fd, 16) < 0) { perror("listen"); return 2; }
+
+    printf("c_engine: listening on %s\n", g_sock_path);
     fflush(stdout);
 
     for (;;) {
@@ -133,4 +189,3 @@ int main(int argc, char** argv) {
     unlink(g_sock_path);
     return 0;
 }
-
