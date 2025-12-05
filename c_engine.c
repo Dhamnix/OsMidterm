@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "blake3.h"
 
 #define OP_UPLOAD_START  0x01
 #define OP_UPLOAD_CHUNK  0x02
@@ -101,68 +102,126 @@ void handle_connection(int cfd) {
                 }
                 fclose(f);
             }
-        } else if (op == OP_UPLOAD_FINISH) {
-            // finalize DAG and compute real CID:
+               } else if (op == OP_UPLOAD_FINISH) {
+            // finalize DAG and compute CID:
             // CID(file) = multibase(base32) · multicodec(manifest) · multihash(serialize(manifest))
-            #include "blake3.h"
 
-            // 1) Re-open the temporary file and hash its contents with BLAKE3
+            const unsigned int chunk_size = 262144; // 256 KiB as in the PDF example
+
+            // temporary file path for this connection
             char path[64];
             snprintf(path, sizeof(path), "upload_%d.bin", cfd);
+
             FILE* f = fopen(path, "rb");
             if (!f) {
-                perror("fopen for hash");
+                perror("fopen for manifest");
                 const char* cid = "CID-ERROR";
                 printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
                 fflush(stdout);
                 send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
             } else {
-                blake3_hasher file_hasher;
-                blake3_hasher_init(&file_hasher);
+                // Build "chunks" array: [{"index": i, "size": n, "hash": "<hex>"} , ...]
+                unsigned long long total_size = 0ULL;
+                unsigned int chunk_index = 0;
 
-                uint8_t buf[4096];
+                // Buffer for serialized chunks array
+                char chunks_json[8192];
+                size_t chunks_len = 0;
+                chunks_json[0] = '\0';
+
+                uint8_t buf[262144];  // read buffer equal to chunk_size
                 size_t nread;
-                unsigned long long file_size = 0;
+
                 while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
-                    blake3_hasher_update(&file_hasher, buf, nread);
-                    file_size += nread;
+                    total_size += nread;
+
+                    // Compute BLAKE3 hash of this chunk
+                    blake3_hasher chunk_hasher;
+                    blake3_hasher_init(&chunk_hasher);
+                    blake3_hasher_update(&chunk_hasher, buf, nread);
+
+                    uint8_t chunk_digest[BLAKE3_OUT_LEN];
+                    blake3_hasher_finalize(&chunk_hasher, chunk_digest, BLAKE3_OUT_LEN);
+
+                    // Convert chunk digest to hex string
+                    char chunk_hash_hex[BLAKE3_OUT_LEN * 2 + 1];
+                    static const char hex_digits[] = "0123456789abcdef";
+                    for (size_t i = 0; i < BLAKE3_OUT_LEN; ++i) {
+                        chunk_hash_hex[2 * i]     = hex_digits[chunk_digest[i] >> 4];
+                        chunk_hash_hex[2 * i + 1] = hex_digits[chunk_digest[i] & 0x0F];
+                    }
+                    chunk_hash_hex[BLAKE3_OUT_LEN * 2] = '\0';
+
+                    // Append JSON entry for this chunk
+                    char entry[256];
+                    int entry_len = snprintf(
+                        entry,
+                        sizeof(entry),
+                        "%s{\"index\":%u,\"size\":%zu,\"hash\":\"%s\"}",
+                        (chunk_index == 0 ? "" : ","),
+                        chunk_index,
+                        nread,
+                        chunk_hash_hex
+                    );
+
+                    if (entry_len <= 0 || chunks_len + (size_t)entry_len >= sizeof(chunks_json)) {
+                        // Not enough space to store full manifest; abort with error CID
+                        fclose(f);
+                        const char* cid = "CID-MANIFEST-CHUNKS-TOO-LARGE";
+                        printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
+                        fflush(stdout);
+                        send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
+                        goto done_upload_finish;
+                    }
+
+                    memcpy(chunks_json + chunks_len, entry, (size_t)entry_len);
+                    chunks_len += (size_t)entry_len;
+                    chunks_json[chunks_len] = '\0';
+
+                    ++chunk_index;
                 }
+
                 fclose(f);
 
-                uint8_t file_hash[BLAKE3_OUT_LEN];
-                blake3_hasher_finalize(&file_hasher, file_hash, BLAKE3_OUT_LEN);
+                // Use the temporary file name as "filename" field
+                const char* filename = path;
 
-                // encode file hash as hex to embed in the manifest
-                char file_hash_hex[BLAKE3_OUT_LEN * 2 + 1];
-                static const char hex_digits[] = "0123456789abcdef";
-                for (size_t i = 0; i < BLAKE3_OUT_LEN; ++i) {
-                    file_hash_hex[2 * i]     = hex_digits[file_hash[i] >> 4];
-                    file_hash_hex[2 * i + 1] = hex_digits[file_hash[i] & 0x0F];
-                }
-                file_hash_hex[BLAKE3_OUT_LEN * 2] = '\0';
-
-                // 2) Build the manifest JSON and serialize it deterministically
-                // NOTE: chunk_size and the fields must match the project PDF.
-                const unsigned int chunk_size = 262144; // example: 256 KiB chunk size
-                char manifest[512];
+                // Build manifest JSON exactly in the format from the PDF:
+                // {
+                //   "version": 1,
+                //   "hash_algo": "blake3",
+                //   "chunk_size": 262144,
+                //   "total_size": 12345678,
+                //   "filename": "example.bin",
+                //   "chunks": [ { "index": 0, "size": ..., "hash": "..." }, ... ]
+                // }
+                char manifest[16384];
                 int manifest_len = snprintf(
                     manifest,
                     sizeof(manifest),
-                    "{\"version\":1,\"hash_algo\":\"blake3\",\"chunk_size\":%u,\"size\":%llu,\"root\":\"%s\"}",
+                    "{\"version\":1,"
+                    "\"hash_algo\":\"blake3\","
+                    "\"chunk_size\":%u,"
+                    "\"total_size\":%llu,"
+                    "\"filename\":\"%s\","
+                    "\"chunks\":[%s]}",
                     chunk_size,
-                    file_size,
-                    file_hash_hex
+                    total_size,
+                    filename,
+                    chunks_json
                 );
+
                 if (manifest_len <= 0 || manifest_len >= (int)sizeof(manifest)) {
                     const char* cid = "CID-MANIFEST-ERROR";
                     printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
                     fflush(stdout);
                     send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
                 } else {
-                    // 3) Compute multihash(manifest) using BLAKE3
+                    // --- multihash(manifest) using BLAKE3 ---
                     blake3_hasher man_hasher;
                     blake3_hasher_init(&man_hasher);
                     blake3_hasher_update(&man_hasher, manifest, (size_t)manifest_len);
+
                     uint8_t man_hash[BLAKE3_OUT_LEN];
                     blake3_hasher_finalize(&man_hasher, man_hash, BLAKE3_OUT_LEN);
 
@@ -176,7 +235,7 @@ void handle_connection(int cfd) {
                     memcpy(multihash + multihash_len, man_hash, BLAKE3_OUT_LEN);
                     multihash_len += BLAKE3_OUT_LEN;
 
-                    // 4) Prepend multicodec(manifest) as a varint prefix
+                    // --- prepend multicodec(manifest) as a varint prefix ---
                     // TODO: set CODEC_MANIFEST according to the PDF's multicodec table.
                     const uint8_t CODEC_MANIFEST = 0x71; // placeholder
                     uint8_t cid_bytes[1 + sizeof(multihash)];
@@ -185,9 +244,8 @@ void handle_connection(int cfd) {
                     memcpy(cid_bytes + cid_bytes_len, multihash, multihash_len);
                     cid_bytes_len += multihash_len;
 
-                    // 5) Wrap everything in multibase(base32) using the "b" prefix
+                    // --- multibase(base32) with 'b' prefix ---
                     static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
-                    // maximum size: 1 (multibase prefix) + base32 length + 1 (null)
                     char cid_str[1 + ((1 + sizeof(multihash) + 4) / 5) * 8 + 1];
                     size_t out_idx = 0;
                     unsigned int bits = 0;
@@ -206,10 +264,10 @@ void handle_connection(int cfd) {
                         unsigned int idx = (acc << (5 - bits)) & 0x1F;
                         cid_str[1 + out_idx++] = alphabet[idx];
                     }
-                    cid_str[0] = 'b';          // multibase base32 prefix
+                    cid_str[0] = 'b';
                     cid_str[1 + out_idx] = '\0';
 
-                    // Optionally rename the data file to CID for direct lookup on download
+                    // Rename data file to CID string (optional but useful for lookup in DOWNLOAD)
                     if (rename(path, cid_str) != 0) {
                         perror("rename to cid");
                     }
@@ -220,6 +278,10 @@ void handle_connection(int cfd) {
                     send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
                 }
             }
+
+        done_upload_finish:
+            ;
+
         } else if (op == OP_DOWNLOAD_START) {
             printf("[ENGINE] DOWNLOAD_START: cid=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
