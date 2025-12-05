@@ -76,23 +76,19 @@ void handle_connection(int cfd) {
         if (op == OP_UPLOAD_START) {
             printf("[ENGINE] UPLOAD_START: name=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
-            // initialize upload state: create/truncate file for this connection
+            // initialize upload state: start a fresh temporary file for this connection
             char path[64];
             snprintf(path, sizeof(path), "upload_%d.bin", cfd);
-
             FILE* f = fopen(path, "wb");
             if (!f) {
                 perror("fopen upload start");
             } else {
-                // فقط فایل رو می‌سازیم/خالی می‌کنیم، چانک‌ها بعداً append می‌شن
                 fclose(f);
             }
-
         } else if (op == OP_UPLOAD_CHUNK) {
-            // process chunk: append payload to file for this connection
+            // process chunk: append payload to the temporary file for this connection
             char path[64];
             snprintf(path, sizeof(path), "upload_%d.bin", cfd);
-
             FILE* f = fopen(path, "ab");
             if (!f) {
                 perror("fopen upload chunk");
@@ -105,14 +101,14 @@ void handle_connection(int cfd) {
                 }
                 fclose(f);
             }
-
         } else if (op == OP_UPLOAD_FINISH) {
-            // finalize upload and compute CID using BLAKE3 over the file contents
+            // finalize DAG and compute real CID:
+            // CID(file) = multibase(base32) · multicodec(manifest) · multihash(serialize(manifest))
             #include "blake3.h"
 
+            // 1) Re-open the temporary file and hash its contents with BLAKE3
             char path[64];
             snprintf(path, sizeof(path), "upload_%d.bin", cfd);
-
             FILE* f = fopen(path, "rb");
             if (!f) {
                 perror("fopen for hash");
@@ -121,44 +117,113 @@ void handle_connection(int cfd) {
                 fflush(stdout);
                 send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
             } else {
-                blake3_hasher hasher;
-                blake3_hasher_init(&hasher);
+                blake3_hasher file_hasher;
+                blake3_hasher_init(&file_hasher);
 
                 uint8_t buf[4096];
                 size_t nread;
+                unsigned long long file_size = 0;
                 while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
-                    blake3_hasher_update(&hasher, buf, nread);
+                    blake3_hasher_update(&file_hasher, buf, nread);
+                    file_size += nread;
                 }
                 fclose(f);
 
-                uint8_t hash[BLAKE3_OUT_LEN];
-                blake3_hasher_finalize(&hasher, hash, BLAKE3_OUT_LEN);
+                uint8_t file_hash[BLAKE3_OUT_LEN];
+                blake3_hasher_finalize(&file_hasher, file_hash, BLAKE3_OUT_LEN);
 
-                // encode hash as hex string to use as CID
-                char cid_buf[BLAKE3_OUT_LEN * 2 + 1];
+                // encode file hash as hex to embed in the manifest
+                char file_hash_hex[BLAKE3_OUT_LEN * 2 + 1];
                 static const char hex_digits[] = "0123456789abcdef";
                 for (size_t i = 0; i < BLAKE3_OUT_LEN; ++i) {
-                    cid_buf[2 * i]     = hex_digits[hash[i] >> 4];
-                    cid_buf[2 * i + 1] = hex_digits[hash[i] & 0x0f];
+                    file_hash_hex[2 * i]     = hex_digits[file_hash[i] >> 4];
+                    file_hash_hex[2 * i + 1] = hex_digits[file_hash[i] & 0x0F];
                 }
-                cid_buf[BLAKE3_OUT_LEN * 2] = '\0';
+                file_hash_hex[BLAKE3_OUT_LEN * 2] = '\0';
 
-                // اختیاری: فایل رو به اسم CID ری‌نیم می‌کنیم تا دانلود راحت بشه
-                if (rename(path, cid_buf) != 0) {
-                    perror("rename to cid");
+                // 2) Build the manifest JSON and serialize it deterministically
+                // NOTE: chunk_size and the fields must match the project PDF.
+                const unsigned int chunk_size = 262144; // example: 256 KiB chunk size
+                char manifest[512];
+                int manifest_len = snprintf(
+                    manifest,
+                    sizeof(manifest),
+                    "{\"version\":1,\"hash_algo\":\"blake3\",\"chunk_size\":%u,\"size\":%llu,\"root\":\"%s\"}",
+                    chunk_size,
+                    file_size,
+                    file_hash_hex
+                );
+                if (manifest_len <= 0 || manifest_len >= (int)sizeof(manifest)) {
+                    const char* cid = "CID-MANIFEST-ERROR";
+                    printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
+                    fflush(stdout);
+                    send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
+                } else {
+                    // 3) Compute multihash(manifest) using BLAKE3
+                    blake3_hasher man_hasher;
+                    blake3_hasher_init(&man_hasher);
+                    blake3_hasher_update(&man_hasher, manifest, (size_t)manifest_len);
+                    uint8_t man_hash[BLAKE3_OUT_LEN];
+                    blake3_hasher_finalize(&man_hasher, man_hash, BLAKE3_OUT_LEN);
+
+                    // multihash encoding: [hash_code][digest_length][digest]
+                    // TODO: set HASH_CODE_BLAKE3_256 according to the PDF's multihash table.
+                    const uint8_t HASH_CODE_BLAKE3_256 = 0x1f; // placeholder
+                    uint8_t multihash[2 + BLAKE3_OUT_LEN];
+                    size_t multihash_len = 0;
+                    multihash[multihash_len++] = HASH_CODE_BLAKE3_256;
+                    multihash[multihash_len++] = (uint8_t)BLAKE3_OUT_LEN;
+                    memcpy(multihash + multihash_len, man_hash, BLAKE3_OUT_LEN);
+                    multihash_len += BLAKE3_OUT_LEN;
+
+                    // 4) Prepend multicodec(manifest) as a varint prefix
+                    // TODO: set CODEC_MANIFEST according to the PDF's multicodec table.
+                    const uint8_t CODEC_MANIFEST = 0x71; // placeholder
+                    uint8_t cid_bytes[1 + sizeof(multihash)];
+                    size_t cid_bytes_len = 0;
+                    cid_bytes[cid_bytes_len++] = CODEC_MANIFEST;
+                    memcpy(cid_bytes + cid_bytes_len, multihash, multihash_len);
+                    cid_bytes_len += multihash_len;
+
+                    // 5) Wrap everything in multibase(base32) using the "b" prefix
+                    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
+                    // maximum size: 1 (multibase prefix) + base32 length + 1 (null)
+                    char cid_str[1 + ((1 + sizeof(multihash) + 4) / 5) * 8 + 1];
+                    size_t out_idx = 0;
+                    unsigned int bits = 0;
+                    unsigned int acc = 0;
+
+                    for (size_t i = 0; i < cid_bytes_len; ++i) {
+                        acc = (acc << 8) | cid_bytes[i];
+                        bits += 8;
+                        while (bits >= 5) {
+                            bits -= 5;
+                            unsigned int idx = (acc >> bits) & 0x1F;
+                            cid_str[1 + out_idx++] = alphabet[idx];
+                        }
+                    }
+                    if (bits > 0) {
+                        unsigned int idx = (acc << (5 - bits)) & 0x1F;
+                        cid_str[1 + out_idx++] = alphabet[idx];
+                    }
+                    cid_str[0] = 'b';          // multibase base32 prefix
+                    cid_str[1 + out_idx] = '\0';
+
+                    // Optionally rename the data file to CID for direct lookup on download
+                    if (rename(path, cid_str) != 0) {
+                        perror("rename to cid");
+                    }
+
+                    const char* cid = cid_str;
+                    printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
+                    fflush(stdout);
+                    send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
                 }
-
-                const char* cid = cid_buf;
-                printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
-                fflush(stdout);
-                send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
             }
-
         } else if (op == OP_DOWNLOAD_START) {
             printf("[ENGINE] DOWNLOAD_START: cid=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
-
-            // look up CID and stream file chunks
+            // look up CID and stream chunks; here we assume the file name is exactly the CID string
             char cid_buf[256];
             size_t cid_len = len < sizeof(cid_buf) - 1 ? len : sizeof(cid_buf) - 1;
             memcpy(cid_buf, payload, cid_len);
@@ -167,7 +232,6 @@ void handle_connection(int cfd) {
             FILE* f = fopen(cid_buf, "rb");
             if (!f) {
                 perror("fopen download");
-                // اگر فایل پیدا نشد، فقط DONE بدون دیتا
                 send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
             } else {
                 uint8_t buf[256 * 1024];
