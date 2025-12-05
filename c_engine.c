@@ -1,4 +1,4 @@
-// Build: gcc -O2 -pthread -o c_engine c_engine.c
+// Build: gcc -O2 -pthread -o c_engine c_engine.c blake3.c
 // Run:   ./c_engine /tmp/cengine.sock
 
 #define _GNU_SOURCE
@@ -76,46 +76,88 @@ void handle_connection(int cfd) {
         if (op == OP_UPLOAD_START) {
             printf("[ENGINE] UPLOAD_START: name=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
-                // initialize upload state: create/truncate file for this connection
-             char path[64];
-             snprintf(path, sizeof(path), "upload_%d.bin", cfd);
- 
-             FILE* f = fopen(path, "wb");
-             if (!f) {
-              perror("fopen upload start");
+            // initialize upload state: create/truncate file for this connection
+            char path[64];
+            snprintf(path, sizeof(path), "upload_%d.bin", cfd);
+
+            FILE* f = fopen(path, "wb");
+            if (!f) {
+                perror("fopen upload start");
             } else {
-            fclose(f); // just truncate/create, chunks will append
+                // فقط فایل رو می‌سازیم/خالی می‌کنیم، چانک‌ها بعداً append می‌شن
+                fclose(f);
             }
 
         } else if (op == OP_UPLOAD_CHUNK) {
             // process chunk: append payload to file for this connection
-           char path[64];
-         snprintf(path, sizeof(path), "upload_%d.bin", cfd);
+            char path[64];
+            snprintf(path, sizeof(path), "upload_%d.bin", cfd);
 
-          FILE* f = fopen(path, "ab");
-         if (!f) {
-         perror("fopen upload chunk");
-         } else {
-         if (len > 0) {
-            size_t written = fwrite(payload, 1, len, f);
-            if (written != len) {
-                perror("fwrite upload chunk");
+            FILE* f = fopen(path, "ab");
+            if (!f) {
+                perror("fopen upload chunk");
+            } else {
+                if (len > 0) {
+                    size_t written = fwrite(payload, 1, len, f);
+                    if (written != len) {
+                        perror("fwrite upload chunk");
+                    }
+                }
+                fclose(f);
             }
-         }
-          fclose(f);
-         }
+
         } else if (op == OP_UPLOAD_FINISH) {
-            // finalize upload and compute CID (here: file name based on cfd)
-            char cid_buf[64];
-            snprintf(cid_buf, sizeof(cid_buf), "upload_%d.bin", cfd);
-            const char* cid = cid_buf;
-            printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
-            fflush(stdout);
-            send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
+            // finalize upload and compute CID using BLAKE3 over the file contents
+            #include "blake3.h"
+
+            char path[64];
+            snprintf(path, sizeof(path), "upload_%d.bin", cfd);
+
+            FILE* f = fopen(path, "rb");
+            if (!f) {
+                perror("fopen for hash");
+                const char* cid = "CID-ERROR";
+                printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
+                fflush(stdout);
+                send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
+            } else {
+                blake3_hasher hasher;
+                blake3_hasher_init(&hasher);
+
+                uint8_t buf[4096];
+                size_t nread;
+                while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
+                    blake3_hasher_update(&hasher, buf, nread);
+                }
+                fclose(f);
+
+                uint8_t hash[BLAKE3_OUT_LEN];
+                blake3_hasher_finalize(&hasher, hash, BLAKE3_OUT_LEN);
+
+                // encode hash as hex string to use as CID
+                char cid_buf[BLAKE3_OUT_LEN * 2 + 1];
+                static const char hex_digits[] = "0123456789abcdef";
+                for (size_t i = 0; i < BLAKE3_OUT_LEN; ++i) {
+                    cid_buf[2 * i]     = hex_digits[hash[i] >> 4];
+                    cid_buf[2 * i + 1] = hex_digits[hash[i] & 0x0f];
+                }
+                cid_buf[BLAKE3_OUT_LEN * 2] = '\0';
+
+                // اختیاری: فایل رو به اسم CID ری‌نیم می‌کنیم تا دانلود راحت بشه
+                if (rename(path, cid_buf) != 0) {
+                    perror("rename to cid");
+                }
+
+                const char* cid = cid_buf;
+                printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
+                fflush(stdout);
+                send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
+            }
+
         } else if (op == OP_DOWNLOAD_START) {
             printf("[ENGINE] DOWNLOAD_START: cid=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
-            
+
             // look up CID and stream file chunks
             char cid_buf[256];
             size_t cid_len = len < sizeof(cid_buf) - 1 ? len : sizeof(cid_buf) - 1;
@@ -125,19 +167,20 @@ void handle_connection(int cfd) {
             FILE* f = fopen(cid_buf, "rb");
             if (!f) {
                 perror("fopen download");
-                // if file didnt get found 
+                // اگر فایل پیدا نشد، فقط DONE بدون دیتا
                 send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
             } else {
                 uint8_t buf[256 * 1024];
                 size_t read_bytes;
                 while ((read_bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
-            if (send_frame(cfd, OP_DOWNLOAD_CHUNK, buf, (uint32_t)read_bytes) < 0) {
-                perror("send_frame download chunk");
-                break;
+                    if (send_frame(cfd, OP_DOWNLOAD_CHUNK, buf, (uint32_t)read_bytes) < 0) {
+                        perror("send_frame download chunk");
+                        break;
+                    }
+                }
+                fclose(f);
+                send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
             }
-        }
-        fclose(f);
-            send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
         } else {
         }
 
@@ -146,7 +189,6 @@ void handle_connection(int cfd) {
     close(cfd);
 }
 
-}
 int main(int argc, char** argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s /tmp/cengine.sock\n", argv[0]);
