@@ -64,10 +64,12 @@ void handle_connection(int cfd) {
         ssize_t r = read_n(cfd, header, 5);
         if (r == 0) break;
         if (r < 0) { break; }
+
         uint8_t op = header[0];
         uint32_t len;
         memcpy(&len, header + 1, 4);
         len = ntohl(len);
+
         uint8_t* payload = NULL;
         if (len) {
             payload = (uint8_t*)malloc(len);
@@ -78,6 +80,7 @@ void handle_connection(int cfd) {
         if (op == OP_UPLOAD_START) {
             printf("[ENGINE] UPLOAD_START: name=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
+
             // start a fresh temporary file for this connection
             char path[64];
             snprintf(path, sizeof(path), "upload_%d.bin", cfd);
@@ -252,7 +255,7 @@ void handle_connection(int cfd) {
                     blake3_hasher_finalize(&man_hasher, man_hash, BLAKE3_OUT_LEN);
 
                     // multihash encoding: [hash_code][digest_length][digest]
-                    const uint8_t HASH_CODE_BLAKE3_256 = 0x1f; // placeholder: adjust to spec if needed
+                    const uint8_t HASH_CODE_BLAKE3_256 = 0x1f; // placeholder
                     uint8_t multihash[2 + BLAKE3_OUT_LEN];
                     size_t multihash_len = 0;
                     multihash[multihash_len++] = HASH_CODE_BLAKE3_256;
@@ -261,7 +264,7 @@ void handle_connection(int cfd) {
                     multihash_len += BLAKE3_OUT_LEN;
 
                     // prepend multicodec(manifest) as a prefix
-                    const uint8_t CODEC_MANIFEST = 0x71; // placeholder: adjust to spec if needed
+                    const uint8_t CODEC_MANIFEST = 0x71; // placeholder
                     uint8_t cid_bytes[1 + sizeof(multihash)];
                     size_t cid_bytes_len = 0;
                     cid_bytes[cid_bytes_len++] = CODEC_MANIFEST;
@@ -320,17 +323,18 @@ void handle_connection(int cfd) {
 
         done_upload_finish:
             ;
-                 } else if (op == OP_DOWNLOAD_START) {
+
+        } else if (op == OP_DOWNLOAD_START) {
             printf("[ENGINE] DOWNLOAD_START: cid=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
 
-            // --- 1) Copy CID string ---
+            // 1) Copy CID string
             char cid[256];
             size_t cid_len = len < sizeof(cid) - 1 ? len : sizeof(cid) - 1;
             memcpy(cid, payload, cid_len);
             cid[cid_len] = '\0';
 
-            // --- 2) Load manifest: manifests/<cid>.json ---
+            // 2) Load manifest: manifests/<cid>.json
             char manifest_path[512];
             snprintf(manifest_path, sizeof(manifest_path), "manifests/%s.json", cid);
 
@@ -368,7 +372,7 @@ void handle_connection(int cfd) {
                             } else {
                                 manifest[msize] = '\0';
 
-                                // --- 3) Find "chunks" array in manifest JSON ---
+                                // 3) Find "chunks" array in manifest JSON
                                 const char* p = strstr(manifest, "\"chunks\"");
                                 if (!p) {
                                     fprintf(stderr, "manifest has no \"chunks\" field\n");
@@ -383,7 +387,7 @@ void handle_connection(int cfd) {
                                     } else {
                                         p++; // move past '['
 
-                                        // --- 4) Iterate over chunk entries ---
+                                        // 4) Iterate over chunk entries
                                         while (1) {
                                             const char* idx_key = strstr(p, "\"index\"");
                                             if (!idx_key) {
@@ -397,6 +401,15 @@ void handle_connection(int cfd) {
                                                 fprintf(stderr, "chunk entry missing size or hash\n");
                                                 break;
                                             }
+
+                                            // parse index value (for debug / ordering, not sent on wire)
+                                            const char* idx_colon = strchr(idx_key, ':');
+                                            if (!idx_colon) {
+                                                fprintf(stderr, "no ':' after index in chunk entry\n");
+                                                break;
+                                            }
+                                            unsigned long index = strtoul(idx_colon + 1, NULL, 10);
+                                            (void)index; // not used in payload, just for internal logic
 
                                             // parse size value
                                             const char* size_colon = strchr(size_key, ':');
@@ -433,7 +446,7 @@ void handle_connection(int cfd) {
                                             // move p forward so next search starts after this chunk
                                             p = q4 + 1;
 
-                                            // --- 5) Build block path: blocks/aa/bb/<hash> ---
+                                            // 5) Build block path: blocks/aa/bb/<hash>
                                             char dir1[64], dir2[80], block_path[160];
                                             if (hash_len < 4) {
                                                 fprintf(stderr, "hash too short for directory scheme\n");
@@ -443,7 +456,7 @@ void handle_connection(int cfd) {
                                             snprintf(dir2, sizeof(dir2), "%s/%.2s", dir1, chunk_hash_hex + 2);
                                             snprintf(block_path, sizeof(block_path), "%s/%s", dir2, chunk_hash_hex);
 
-                                            // --- 6) Read chunk from storage ---
+                                            // 6) Read chunk from storage
                                             FILE* bf = fopen(block_path, "rb");
                                             if (!bf) {
                                                 perror("fopen block for download");
@@ -451,7 +464,7 @@ void handle_connection(int cfd) {
                                             }
 
                                             if (chunk_size > 1024ULL * 1024ULL) {
-                                                // safety limit: chunks should be small (e.g., 256 KiB)
+                                                // safety limit
                                                 fprintf(stderr, "chunk_size too large\n");
                                                 fclose(bf);
                                                 break;
@@ -472,7 +485,7 @@ void handle_connection(int cfd) {
                                                 break;
                                             }
 
-                                            // --- 7) Verify hash(BLAKE3(chunk_buf)) == hash in manifest ---
+                                            // 7) Verify BLAKE3(chunk_buf) == hash in manifest
                                             blake3_hasher verify_hasher;
                                             blake3_hasher_init(&verify_hasher);
                                             blake3_hasher_update(&verify_hasher, chunk_buf, (size_t)chunk_size);
@@ -494,7 +507,7 @@ void handle_connection(int cfd) {
                                                 break;
                                             }
 
-                                            // --- 8) Send verified chunk to client ---
+                                            // 8) Send verified chunk to client as raw bytes
                                             if (send_frame(cfd, OP_DOWNLOAD_CHUNK,
                                                            chunk_buf,
                                                            (uint32_t)chunk_size) < 0) {
@@ -517,14 +530,18 @@ void handle_connection(int cfd) {
                 }
             }
 
-
-         else {
+        } else {
+            // unknown op, ignore
         }
 
-        free(payload);
+        if (payload) {
+            free(payload);
+        }
     }
+
     close(cfd);
 }
+
 
 int main(int argc, char** argv) {
     if (argc != 2) {
