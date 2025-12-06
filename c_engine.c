@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -77,7 +78,7 @@ void handle_connection(int cfd) {
         if (op == OP_UPLOAD_START) {
             printf("[ENGINE] UPLOAD_START: name=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
-            // initialize upload state: start a fresh temporary file for this connection
+            // start a fresh temporary file for this connection
             char path[64];
             snprintf(path, sizeof(path), "upload_%d.bin", cfd);
             FILE* f = fopen(path, "wb");
@@ -86,8 +87,9 @@ void handle_connection(int cfd) {
             } else {
                 fclose(f);
             }
+
         } else if (op == OP_UPLOAD_CHUNK) {
-            // process chunk: append payload to the temporary file for this connection
+            // append payload to the temporary file for this connection
             char path[64];
             snprintf(path, sizeof(path), "upload_%d.bin", cfd);
             FILE* f = fopen(path, "ab");
@@ -102,11 +104,12 @@ void handle_connection(int cfd) {
                 }
                 fclose(f);
             }
-               } else if (op == OP_UPLOAD_FINISH) {
+
+        } else if (op == OP_UPLOAD_FINISH) {
             // finalize DAG and compute CID:
             // CID(file) = multibase(base32) · multicodec(manifest) · multihash(serialize(manifest))
 
-            const unsigned int chunk_size = 262144; // 256 KiB as in the PDF example
+            const unsigned int chunk_size = 262144; // 256 KiB default chunk size
 
             // temporary file path for this connection
             char path[64];
@@ -120,22 +123,25 @@ void handle_connection(int cfd) {
                 fflush(stdout);
                 send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
             } else {
-                // Build "chunks" array: [{"index": i, "size": n, "hash": "<hex>"} , ...]
+                // ensure base directories exist
+                mkdir("blocks", 0777);
+                mkdir("manifests", 0777);
+
+                // build "chunks" array: [{"index": i, "size": n, "hash": "<hex>"} , ...]
                 unsigned long long total_size = 0ULL;
                 unsigned int chunk_index = 0;
 
-                // Buffer for serialized chunks array
                 char chunks_json[8192];
                 size_t chunks_len = 0;
                 chunks_json[0] = '\0';
 
-                uint8_t buf[262144];  // read buffer equal to chunk_size
+                uint8_t buf[262144];  // read buffer = chunk_size
                 size_t nread;
 
                 while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
                     total_size += nread;
 
-                    // Compute BLAKE3 hash of this chunk
+                    // compute BLAKE3 hash of this chunk
                     blake3_hasher chunk_hasher;
                     blake3_hasher_init(&chunk_hasher);
                     blake3_hasher_update(&chunk_hasher, buf, nread);
@@ -143,7 +149,7 @@ void handle_connection(int cfd) {
                     uint8_t chunk_digest[BLAKE3_OUT_LEN];
                     blake3_hasher_finalize(&chunk_hasher, chunk_digest, BLAKE3_OUT_LEN);
 
-                    // Convert chunk digest to hex string
+                    // convert chunk digest to hex string
                     char chunk_hash_hex[BLAKE3_OUT_LEN * 2 + 1];
                     static const char hex_digits[] = "0123456789abcdef";
                     for (size_t i = 0; i < BLAKE3_OUT_LEN; ++i) {
@@ -152,7 +158,35 @@ void handle_connection(int cfd) {
                     }
                     chunk_hash_hex[BLAKE3_OUT_LEN * 2] = '\0';
 
-                    // Append JSON entry for this chunk
+                    // store this chunk under blocks/aa/bb/<hash>
+                    char dir1[64], dir2[80], block_path[160];
+                    // first two hex chars -> aa, next two -> bb
+                    snprintf(dir1, sizeof(dir1), "blocks/%.2s", chunk_hash_hex);
+                    mkdir(dir1, 0777);
+
+                    snprintf(dir2, sizeof(dir2), "%s/%.2s", dir1, chunk_hash_hex + 2);
+                    mkdir(dir2, 0777);
+
+                    snprintf(block_path, sizeof(block_path), "%s/%s", dir2, chunk_hash_hex);
+
+                    // do not rewrite if block already exists (simple dedup)
+                    FILE* bf = fopen(block_path, "rb");
+                    if (bf) {
+                        fclose(bf);
+                    } else {
+                        bf = fopen(block_path, "wb");
+                        if (!bf) {
+                            perror("fopen block write");
+                        } else {
+                            size_t bw = fwrite(buf, 1, nread, bf);
+                            if (bw != nread) {
+                                perror("fwrite block");
+                            }
+                            fclose(bf);
+                        }
+                    }
+
+                    // append JSON entry for this chunk
                     char entry[256];
                     int entry_len = snprintf(
                         entry,
@@ -165,7 +199,7 @@ void handle_connection(int cfd) {
                     );
 
                     if (entry_len <= 0 || chunks_len + (size_t)entry_len >= sizeof(chunks_json)) {
-                        // Not enough space to store full manifest; abort with error CID
+                        // not enough space to store full manifest; abort with error CID
                         fclose(f);
                         const char* cid = "CID-MANIFEST-CHUNKS-TOO-LARGE";
                         printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
@@ -183,18 +217,10 @@ void handle_connection(int cfd) {
 
                 fclose(f);
 
-                // Use the temporary file name as "filename" field
+                // use the temporary file name as "filename" field
                 const char* filename = path;
 
-                // Build manifest JSON exactly in the format from the PDF:
-                // {
-                //   "version": 1,
-                //   "hash_algo": "blake3",
-                //   "chunk_size": 262144,
-                //   "total_size": 12345678,
-                //   "filename": "example.bin",
-                //   "chunks": [ { "index": 0, "size": ..., "hash": "..." }, ... ]
-                // }
+                // build manifest JSON exactly in the required format
                 char manifest[16384];
                 int manifest_len = snprintf(
                     manifest,
@@ -217,7 +243,7 @@ void handle_connection(int cfd) {
                     fflush(stdout);
                     send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
                 } else {
-                    // --- multihash(manifest) using BLAKE3 ---
+                    // multihash(manifest) using BLAKE3
                     blake3_hasher man_hasher;
                     blake3_hasher_init(&man_hasher);
                     blake3_hasher_update(&man_hasher, manifest, (size_t)manifest_len);
@@ -226,8 +252,7 @@ void handle_connection(int cfd) {
                     blake3_hasher_finalize(&man_hasher, man_hash, BLAKE3_OUT_LEN);
 
                     // multihash encoding: [hash_code][digest_length][digest]
-                    // TODO: set HASH_CODE_BLAKE3_256 according to the PDF's multihash table.
-                    const uint8_t HASH_CODE_BLAKE3_256 = 0x1f; // placeholder
+                    const uint8_t HASH_CODE_BLAKE3_256 = 0x1f; // placeholder: adjust to spec if needed
                     uint8_t multihash[2 + BLAKE3_OUT_LEN];
                     size_t multihash_len = 0;
                     multihash[multihash_len++] = HASH_CODE_BLAKE3_256;
@@ -235,16 +260,15 @@ void handle_connection(int cfd) {
                     memcpy(multihash + multihash_len, man_hash, BLAKE3_OUT_LEN);
                     multihash_len += BLAKE3_OUT_LEN;
 
-                    // --- prepend multicodec(manifest) as a varint prefix ---
-                    // TODO: set CODEC_MANIFEST according to the PDF's multicodec table.
-                    const uint8_t CODEC_MANIFEST = 0x71; // placeholder
+                    // prepend multicodec(manifest) as a prefix
+                    const uint8_t CODEC_MANIFEST = 0x71; // placeholder: adjust to spec if needed
                     uint8_t cid_bytes[1 + sizeof(multihash)];
                     size_t cid_bytes_len = 0;
                     cid_bytes[cid_bytes_len++] = CODEC_MANIFEST;
                     memcpy(cid_bytes + cid_bytes_len, multihash, multihash_len);
                     cid_bytes_len += multihash_len;
 
-                    // --- multibase(base32) with 'b' prefix ---
+                    // multibase(base32) with 'b' prefix
                     static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
                     char cid_str[1 + ((1 + sizeof(multihash) + 4) / 5) * 8 + 1];
                     size_t out_idx = 0;
@@ -267,9 +291,24 @@ void handle_connection(int cfd) {
                     cid_str[0] = 'b';
                     cid_str[1 + out_idx] = '\0';
 
-                    // Rename data file to CID string (optional but useful for lookup in DOWNLOAD)
-                    if (rename(path, cid_str) != 0) {
-                        perror("rename to cid");
+                    // write manifest to manifests/<cid>.json
+                    char manifest_path[256];
+                    snprintf(manifest_path, sizeof(manifest_path),
+                             "manifests/%s.json", cid_str);
+                    FILE* mf = fopen(manifest_path, "wb");
+                    if (!mf) {
+                        perror("fopen manifest write");
+                    } else {
+                        size_t mw = fwrite(manifest, 1, manifest_len, mf);
+                        if (mw != (size_t)manifest_len) {
+                            perror("fwrite manifest");
+                        }
+                        fclose(mf);
+                    }
+
+                    // temporary file no longer needed: remove it
+                    if (remove(path) != 0) {
+                        perror("remove temp upload file");
                     }
 
                     const char* cid = cid_str;
@@ -281,33 +320,205 @@ void handle_connection(int cfd) {
 
         done_upload_finish:
             ;
-
-        } else if (op == OP_DOWNLOAD_START) {
+                 } else if (op == OP_DOWNLOAD_START) {
             printf("[ENGINE] DOWNLOAD_START: cid=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
-            // look up CID and stream chunks; here we assume the file name is exactly the CID string
-            char cid_buf[256];
-            size_t cid_len = len < sizeof(cid_buf) - 1 ? len : sizeof(cid_buf) - 1;
-            memcpy(cid_buf, payload, cid_len);
-            cid_buf[cid_len] = '\0';
 
-            FILE* f = fopen(cid_buf, "rb");
-            if (!f) {
-                perror("fopen download");
+            // --- 1) Copy CID string ---
+            char cid[256];
+            size_t cid_len = len < sizeof(cid) - 1 ? len : sizeof(cid) - 1;
+            memcpy(cid, payload, cid_len);
+            cid[cid_len] = '\0';
+
+            // --- 2) Load manifest: manifests/<cid>.json ---
+            char manifest_path[512];
+            snprintf(manifest_path, sizeof(manifest_path), "manifests/%s.json", cid);
+
+            FILE* mf = fopen(manifest_path, "rb");
+            if (!mf) {
+                perror("fopen manifest");
                 send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
             } else {
-                uint8_t buf[256 * 1024];
-                size_t read_bytes;
-                while ((read_bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
-                    if (send_frame(cfd, OP_DOWNLOAD_CHUNK, buf, (uint32_t)read_bytes) < 0) {
-                        perror("send_frame download chunk");
-                        break;
+                if (fseek(mf, 0, SEEK_END) != 0) {
+                    perror("fseek manifest");
+                    fclose(mf);
+                    send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+                } else {
+                    long msize_l = ftell(mf);
+                    if (msize_l < 0) {
+                        perror("ftell manifest");
+                        fclose(mf);
+                        send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+                    } else {
+                        size_t msize = (size_t)msize_l;
+                        rewind(mf);
+
+                        char* manifest = (char*)malloc(msize + 1);
+                        if (!manifest) {
+                            perror("malloc manifest");
+                            fclose(mf);
+                            send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+                        } else {
+                            size_t mr = fread(manifest, 1, msize, mf);
+                            fclose(mf);
+                            if (mr != msize) {
+                                perror("fread manifest");
+                                free(manifest);
+                                send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+                            } else {
+                                manifest[msize] = '\0';
+
+                                // --- 3) Find "chunks" array in manifest JSON ---
+                                const char* p = strstr(manifest, "\"chunks\"");
+                                if (!p) {
+                                    fprintf(stderr, "manifest has no \"chunks\" field\n");
+                                    free(manifest);
+                                    send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+                                } else {
+                                    p = strchr(p, '[');
+                                    if (!p) {
+                                        fprintf(stderr, "manifest has no '[' for chunks array\n");
+                                        free(manifest);
+                                        send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+                                    } else {
+                                        p++; // move past '['
+
+                                        // --- 4) Iterate over chunk entries ---
+                                        while (1) {
+                                            const char* idx_key = strstr(p, "\"index\"");
+                                            if (!idx_key) {
+                                                // no more chunks
+                                                break;
+                                            }
+
+                                            const char* size_key = strstr(idx_key, "\"size\"");
+                                            const char* hash_key = strstr(idx_key, "\"hash\"");
+                                            if (!size_key || !hash_key) {
+                                                fprintf(stderr, "chunk entry missing size or hash\n");
+                                                break;
+                                            }
+
+                                            // parse size value
+                                            const char* size_colon = strchr(size_key, ':');
+                                            if (!size_colon) {
+                                                fprintf(stderr, "no ':' after size in chunk entry\n");
+                                                break;
+                                            }
+                                            unsigned long long chunk_size = strtoull(size_colon + 1, NULL, 10);
+                                            if (chunk_size == 0) {
+                                                fprintf(stderr, "chunk_size is 0 or failed to parse\n");
+                                                break;
+                                            }
+
+                                            // parse hash value: "hash":"<hex>"
+                                            const char* q1 = strchr(hash_key, '"');      // start of "hash"
+                                            if (!q1) { fprintf(stderr, "bad hash field\n"); break; }
+                                            const char* q2 = strchr(q1 + 1, '"');        // end of "hash"
+                                            if (!q2) { fprintf(stderr, "bad hash field\n"); break; }
+                                            const char* q3 = strchr(q2 + 1, '"');        // first quote before value
+                                            if (!q3) { fprintf(stderr, "bad hash field\n"); break; }
+                                            const char* q4 = strchr(q3 + 1, '"');        // end of value
+                                            if (!q4) { fprintf(stderr, "bad hash field\n"); break; }
+
+                                            size_t hash_len = (size_t)(q4 - (q3 + 1));
+                                            if (hash_len == 0 || hash_len >= BLAKE3_OUT_LEN * 2 + 1) {
+                                                fprintf(stderr, "invalid hash length in manifest\n");
+                                                break;
+                                            }
+
+                                            char chunk_hash_hex[BLAKE3_OUT_LEN * 2 + 1];
+                                            memcpy(chunk_hash_hex, q3 + 1, hash_len);
+                                            chunk_hash_hex[hash_len] = '\0';
+
+                                            // move p forward so next search starts after this chunk
+                                            p = q4 + 1;
+
+                                            // --- 5) Build block path: blocks/aa/bb/<hash> ---
+                                            char dir1[64], dir2[80], block_path[160];
+                                            if (hash_len < 4) {
+                                                fprintf(stderr, "hash too short for directory scheme\n");
+                                                break;
+                                            }
+                                            snprintf(dir1, sizeof(dir1), "blocks/%.2s", chunk_hash_hex);
+                                            snprintf(dir2, sizeof(dir2), "%s/%.2s", dir1, chunk_hash_hex + 2);
+                                            snprintf(block_path, sizeof(block_path), "%s/%s", dir2, chunk_hash_hex);
+
+                                            // --- 6) Read chunk from storage ---
+                                            FILE* bf = fopen(block_path, "rb");
+                                            if (!bf) {
+                                                perror("fopen block for download");
+                                                break;
+                                            }
+
+                                            if (chunk_size > 1024ULL * 1024ULL) {
+                                                // safety limit: chunks should be small (e.g., 256 KiB)
+                                                fprintf(stderr, "chunk_size too large\n");
+                                                fclose(bf);
+                                                break;
+                                            }
+
+                                            uint8_t* chunk_buf = (uint8_t*)malloc((size_t)chunk_size);
+                                            if (!chunk_buf) {
+                                                perror("malloc chunk_buf");
+                                                fclose(bf);
+                                                break;
+                                            }
+
+                                            size_t rb = fread(chunk_buf, 1, (size_t)chunk_size, bf);
+                                            fclose(bf);
+                                            if (rb != (size_t)chunk_size) {
+                                                fprintf(stderr, "short read on block file\n");
+                                                free(chunk_buf);
+                                                break;
+                                            }
+
+                                            // --- 7) Verify hash(BLAKE3(chunk_buf)) == hash in manifest ---
+                                            blake3_hasher verify_hasher;
+                                            blake3_hasher_init(&verify_hasher);
+                                            blake3_hasher_update(&verify_hasher, chunk_buf, (size_t)chunk_size);
+
+                                            uint8_t verify_digest[BLAKE3_OUT_LEN];
+                                            blake3_hasher_finalize(&verify_hasher, verify_digest, BLAKE3_OUT_LEN);
+
+                                            char verify_hex[BLAKE3_OUT_LEN * 2 + 1];
+                                            static const char hex_digits[] = "0123456789abcdef";
+                                            for (size_t i = 0; i < BLAKE3_OUT_LEN; ++i) {
+                                                verify_hex[2 * i]     = hex_digits[verify_digest[i] >> 4];
+                                                verify_hex[2 * i + 1] = hex_digits[verify_digest[i] & 0x0F];
+                                            }
+                                            verify_hex[BLAKE3_OUT_LEN * 2] = '\0';
+
+                                            if (strcmp(verify_hex, chunk_hash_hex) != 0) {
+                                                fprintf(stderr, "chunk hash mismatch for block %s\n", block_path);
+                                                free(chunk_buf);
+                                                break;
+                                            }
+
+                                            // --- 8) Send verified chunk to client ---
+                                            if (send_frame(cfd, OP_DOWNLOAD_CHUNK,
+                                                           chunk_buf,
+                                                           (uint32_t)chunk_size) < 0) {
+                                                perror("send_frame download chunk");
+                                                free(chunk_buf);
+                                                break;
+                                            }
+
+                                            free(chunk_buf);
+                                        } // end while chunks
+
+                                        // send final DONE frame
+                                        send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+                                        free(manifest);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                fclose(f);
-                send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
             }
-        } else {
+
+
+         else {
         }
 
         free(payload);
