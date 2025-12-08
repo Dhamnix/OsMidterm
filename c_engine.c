@@ -59,6 +59,9 @@ int send_frame(int fd, uint8_t op, const void* payload, uint32_t len) {
 }
 
 void handle_connection(int cfd) {
+	    // buffer to remember original uploaded filename for this connection
+    char upload_filename[256];
+    upload_filename[0] = '\0';
     for (;;) {
         uint8_t header[5];
         ssize_t r = read_n(cfd, header, 5);
@@ -80,6 +83,12 @@ void handle_connection(int cfd) {
         if (op == OP_UPLOAD_START) {
             printf("[ENGINE] UPLOAD_START: name=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
+            // remember original filename (with extension) from payload
+            size_t name_len = len < sizeof(upload_filename) - 1
+                              ? len
+                              : sizeof(upload_filename) - 1;
+            memcpy(upload_filename, payload, name_len);
+            upload_filename[name_len] = '\0';
 
             // start a fresh temporary file for this connection
             char path[64];
@@ -220,8 +229,9 @@ void handle_connection(int cfd) {
 
                 fclose(f);
 
-                // use the temporary file name as "filename" field
-                const char* filename = path;
+                // use the original uploaded filename if available, otherwise fall back to temp path
+                const char* filename = (upload_filename[0] != '\0') ? upload_filename : path;
+
 
                 // build manifest JSON exactly in the required format
                 char manifest[16384];
