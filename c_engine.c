@@ -1,4 +1,5 @@
-// Build: gcc -O2 -pthread -o c_engine c_engine.c blake3.c
+// Build: gcc -O2 -pthread -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 \
+//              -o c_engine c_engine.c blake3.c blake3_dispatch.c blake3_portable.c
 // Run:   ./c_engine /tmp/cengine.sock
 
 #define _GNU_SOURCE
@@ -59,9 +60,10 @@ int send_frame(int fd, uint8_t op, const void* payload, uint32_t len) {
 }
 
 void handle_connection(int cfd) {
-	    // buffer to remember original uploaded filename for this connection
+    // buffer to remember original uploaded filename for this connection
     char upload_filename[256];
     upload_filename[0] = '\0';
+
     for (;;) {
         uint8_t header[5];
         ssize_t r = read_n(cfd, header, 5);
@@ -83,6 +85,7 @@ void handle_connection(int cfd) {
         if (op == OP_UPLOAD_START) {
             printf("[ENGINE] UPLOAD_START: name=\"%.*s\"\n", (int)len, (char*)payload);
             fflush(stdout);
+
             // remember original filename (with extension) from payload
             size_t name_len = len < sizeof(upload_filename) - 1
                               ? len
@@ -121,7 +124,7 @@ void handle_connection(int cfd) {
             // finalize DAG and compute CID:
             // CID(file) = multibase(base32) · multicodec(manifest) · multihash(serialize(manifest))
 
-            const unsigned int chunk_size = 262144; // 256 KiB default chunk size
+            const unsigned int chunk_size = 262144; // default chunk size (bytes) – change here if needed
 
             // temporary file path for this connection
             char path[64];
@@ -139,6 +142,18 @@ void handle_connection(int cfd) {
                 mkdir("blocks", 0777);
                 mkdir("manifests", 0777);
 
+                // allocate read buffer = chunk_size
+                uint8_t* buf = (uint8_t*)malloc(chunk_size);
+                if (!buf) {
+                    perror("malloc chunk buffer");
+                    fclose(f);
+                    const char* cid = "CID-MEM-ERROR";
+                    printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
+                    fflush(stdout);
+                    send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
+                    goto done_upload_finish;
+                }
+
                 // build "chunks" array: [{"index": i, "size": n, "hash": "<hex>"} , ...]
                 unsigned long long total_size = 0ULL;
                 unsigned int chunk_index = 0;
@@ -147,10 +162,9 @@ void handle_connection(int cfd) {
                 size_t chunks_len = 0;
                 chunks_json[0] = '\0';
 
-                uint8_t buf[262144];  // read buffer = chunk_size
                 size_t nread;
 
-                while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
+                while ((nread = fread(buf, 1, chunk_size, f)) > 0) {
                     total_size += nread;
 
                     // compute BLAKE3 hash of this chunk
@@ -213,6 +227,7 @@ void handle_connection(int cfd) {
                     if (entry_len <= 0 || chunks_len + (size_t)entry_len >= sizeof(chunks_json)) {
                         // not enough space to store full manifest; abort with error CID
                         fclose(f);
+                        free(buf);
                         const char* cid = "CID-MANIFEST-CHUNKS-TOO-LARGE";
                         printf("[ENGINE] UPLOAD_FINISH -> returning CID %s\n", cid);
                         fflush(stdout);
@@ -228,10 +243,10 @@ void handle_connection(int cfd) {
                 }
 
                 fclose(f);
+                free(buf);
 
                 // use the original uploaded filename if available, otherwise fall back to temp path
                 const char* filename = (upload_filename[0] != '\0') ? upload_filename : path;
-
 
                 // build manifest JSON exactly in the required format
                 char manifest[16384];
@@ -427,8 +442,8 @@ void handle_connection(int cfd) {
                                                 fprintf(stderr, "no ':' after size in chunk entry\n");
                                                 break;
                                             }
-                                            unsigned long long chunk_size = strtoull(size_colon + 1, NULL, 10);
-                                            if (chunk_size == 0) {
+                                            unsigned long long chunk_size_val = strtoull(size_colon + 1, NULL, 10);
+                                            if (chunk_size_val == 0) {
                                                 fprintf(stderr, "chunk_size is 0 or failed to parse\n");
                                                 break;
                                             }
@@ -473,23 +488,23 @@ void handle_connection(int cfd) {
                                                 break;
                                             }
 
-                                            if (chunk_size > 1024ULL * 1024ULL) {
-                                                // safety limit
+                                            if (chunk_size_val > 1024ULL * 1024ULL) {
+                                                // safety limit – adjust if you use very large chunks
                                                 fprintf(stderr, "chunk_size too large\n");
                                                 fclose(bf);
                                                 break;
                                             }
 
-                                            uint8_t* chunk_buf = (uint8_t*)malloc((size_t)chunk_size);
+                                            uint8_t* chunk_buf = (uint8_t*)malloc((size_t)chunk_size_val);
                                             if (!chunk_buf) {
                                                 perror("malloc chunk_buf");
                                                 fclose(bf);
                                                 break;
                                             }
 
-                                            size_t rb = fread(chunk_buf, 1, (size_t)chunk_size, bf);
+                                            size_t rb = fread(chunk_buf, 1, (size_t)chunk_size_val, bf);
                                             fclose(bf);
-                                            if (rb != (size_t)chunk_size) {
+                                            if (rb != (size_t)chunk_size_val) {
                                                 fprintf(stderr, "short read on block file\n");
                                                 free(chunk_buf);
                                                 break;
@@ -498,7 +513,7 @@ void handle_connection(int cfd) {
                                             // 7) Verify BLAKE3(chunk_buf) == hash in manifest
                                             blake3_hasher verify_hasher;
                                             blake3_hasher_init(&verify_hasher);
-                                            blake3_hasher_update(&verify_hasher, chunk_buf, (size_t)chunk_size);
+                                            blake3_hasher_update(&verify_hasher, chunk_buf, (size_t)chunk_size_val);
 
                                             uint8_t verify_digest[BLAKE3_OUT_LEN];
                                             blake3_hasher_finalize(&verify_hasher, verify_digest, BLAKE3_OUT_LEN);
@@ -520,7 +535,7 @@ void handle_connection(int cfd) {
                                             // 8) Send verified chunk to client as raw bytes
                                             if (send_frame(cfd, OP_DOWNLOAD_CHUNK,
                                                            chunk_buf,
-                                                           (uint32_t)chunk_size) < 0) {
+                                                           (uint32_t)chunk_size_val) < 0) {
                                                 perror("send_frame download chunk");
                                                 free(chunk_buf);
                                                 break;
@@ -551,7 +566,6 @@ void handle_connection(int cfd) {
 
     close(cfd);
 }
-
 
 int main(int argc, char** argv) {
     if (argc != 2) {
