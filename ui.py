@@ -6,6 +6,8 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import http.client
+import json
+import os
 
 BACKEND_HOST = "127.0.0.1"
 BACKEND_PORT = 9000  # main.py HTTP gateway
@@ -184,7 +186,7 @@ HTML_PAGE = """<!doctype html>
       <!-- Download Card -->
       <div class="card">
         <h2>Download by CID</h2>
-        <p>Enter a valid CID. The UI will redirect to the backend and trigger a direct download.</p>
+        <p>Enter a valid CID. The UI will read the manifest, get the original filename, and download with that name.</p>
         <label for="cidInput">CID</label>
         <input id="cidInput" type="text" placeholder="example: boe...">
 
@@ -262,10 +264,11 @@ HTML_PAGE = """<!doctype html>
         return;
       }
 
+      // Normal navigation; server will set correct filename with Content-Disposition
       const url = '/download?cid=' + encodeURIComponent(cid);
       window.location.href = url;
 
-      downloadStatus.textContent = 'Download started via backend.';
+      downloadStatus.textContent = 'Download started.';
       downloadStatus.className = 'status ok';
     }
 
@@ -277,8 +280,22 @@ HTML_PAGE = """<!doctype html>
 """
 
 
+def load_manifest(cid: str):
+    """
+    Load manifest JSON for a given CID from manifests/<cid>.json.
+    Returns dict or None on error.
+    """
+    manifest_path = os.path.join("manifests", cid + ".json")
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[UI] Failed to load manifest for CID={cid}: {e}")
+        return None
+
+
 class UIHandler(BaseHTTPRequestHandler):
-    server_version = "ContentEngineUI/0.1"
+    server_version = "ContentEngineUI/0.2"
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -293,7 +310,7 @@ class UIHandler(BaseHTTPRequestHandler):
             self.wfile.write(page_bytes)
             return
 
-        # Redirect download → backend /download
+        # Proxy download → backend /download, but set filename from manifest
         if parsed.path == "/download":
             qs = parse_qs(parsed.query)
             cid = qs.get("cid", [None])[0]
@@ -301,11 +318,68 @@ class UIHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "Missing cid parameter")
                 return
 
-            backend_url = f"http://{BACKEND_HOST}:{BACKEND_PORT}/download?cid={cid}"
+            cid = cid.strip()
+            print(f"[UI] Download requested for CID={cid}")
 
-            self.send_response(302)
-            self.send_header("Location", backend_url)
-            self.end_headers()
+            manifest = load_manifest(cid)
+            if manifest is not None:
+                filename = manifest.get("filename") or f"download_{cid[:8]}"
+                total_size = manifest.get("total_size")
+            else:
+                filename = f"download_{cid[:8]}"
+                total_size = None
+
+            # Contact backend
+            try:
+                conn = http.client.HTTPConnection(BACKEND_HOST, BACKEND_PORT, timeout=20)
+                backend_path = f"/download?cid={cid}"
+                conn.request("GET", backend_path)
+                resp = conn.getresponse()
+            except Exception as e:
+                self.send_error(502, f"Error contacting backend: {e}")
+                return
+
+            try:
+                if resp.status != 200:
+                    body = resp.read()
+                    self.send_response(resp.status)
+                    ctype = resp.getheader("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                # Stream file back to browser with proper filename
+                self.send_response(200)
+                content_type = resp.getheader("Content-Type", "application/octet-stream")
+                self.send_header("Content-Type", content_type)
+
+                # Set filename from manifest (so browser saves with original name.ext)
+                # Basic ASCII-safe header; برای پروژه کافی است
+                safe_name = filename.replace('"', "_")
+                self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+
+                # Optionally set Content-Length from manifest.total_size if available
+                if isinstance(total_size, int) and total_size >= 0:
+                    self.send_header("Content-Length", str(total_size))
+
+                self.end_headers()
+
+                total_sent = 0
+                chunk_size = 256 * 1024
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    total_sent += len(chunk)
+
+                print(f"[UI] Finished streaming CID={cid}, bytes_sent={total_sent}")
+
+            finally:
+                conn.close()
             return
 
         # Anything else
