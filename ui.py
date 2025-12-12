@@ -58,7 +58,6 @@ HTML_PAGE = """<!doctype html>
       border-radius: 12px;
       padding: 16px 16px 20px;
       border: 1px solid #1f2937;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.4);
     }
     .card h2 {
       margin: 0 0 8px;
@@ -85,11 +84,7 @@ HTML_PAGE = """<!doctype html>
       border: 1px solid #374151;
       margin-bottom: 10px;
     }
-    input[type="text"]::placeholder {
-      color: #6b7280;
-    }
     button {
-      appearance: none;
       border: none;
       border-radius: 9999px;
       padding: 8px 16px;
@@ -98,21 +93,9 @@ HTML_PAGE = """<!doctype html>
       background: #22c55e;
       color: white;
       font-weight: 600;
-      box-shadow: 0 8px 20px rgba(34,197,94,0.4);
-      transition: transform 0.1s ease, box-shadow 0.1s ease, filter 0.15s ease;
-    }
-    button:hover {
-      filter: brightness(1.05);
-      transform: translateY(-1px);
-      box-shadow: 0 10px 25px rgba(34,197,94,0.55);
-    }
-    button:active {
-      transform: translateY(0);
-      box-shadow: 0 4px 12px rgba(34,197,94,0.35);
     }
     .btn-secondary {
       background: #3b82f6;
-      box-shadow: 0 8px 20px rgba(59,130,246,0.4);
     }
     .status {
       margin-top: 10px;
@@ -133,184 +116,135 @@ HTML_PAGE = """<!doctype html>
       border: 1px solid #1f2937;
       font-size: 0.75rem;
     }
-    .footer {
-      margin-top: 24px;
-      text-align: center;
-      font-size: 0.75rem;
-      color: #6b7280;
-    }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      background: #020617;
-      border: 1px solid #1f2937;
-      font-size: 0.7rem;
-      color: #9ca3af;
-      margin-bottom: 10px;
-    }
-    .pill span {
-      direction: ltr;
-      font-family: monospace;
-      font-size: 0.7rem;
-    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>Content Engine Web UI</h1>
     <div class="subtitle">
-      Simple local interface for uploading and downloading files via the HTTP gateway.
+      Upload files and download them again using a CID.
     </div>
 
     <div class="grid">
-      <!-- Upload Card -->
       <div class="card">
         <h2>Upload file → Get CID</h2>
-        <p>Select a file. It will be sent (as raw bytes) to the HTTP gateway, then stored by the engine. The gateway returns a CID.</p>
-        <div class="pill">
-          Backend:
-          <span>http://127.0.0.1:9000</span>
-        </div>
         <label for="fileInput">Choose file</label>
         <input id="fileInput" type="file">
-
         <button id="uploadBtn">Upload</button>
-
         <div id="uploadStatus" class="status"></div>
         <div id="cidBox" class="cid-output"></div>
       </div>
 
-      <!-- Download Card -->
       <div class="card">
         <h2>Download by CID</h2>
-        <p>Enter a valid CID. The UI will read the manifest, get the original filename, and download with that name.</p>
         <label for="cidInput">CID</label>
-        <input id="cidInput" type="text" placeholder="example: boe...">
-
+        <input id="cidInput" type="text" placeholder="example: b...">
         <button id="downloadBtn" class="btn-secondary">Download</button>
-
         <div id="downloadStatus" class="status"></div>
       </div>
     </div>
-
-    <div class="footer">
-      Steps: run c_engine → run main.py (gateway) → run ui.py → open http://127.0.0.1:8000/
-    </div>
   </div>
 
-  <script>
-    const uploadBtn = document.getElementById('uploadBtn');
-    const fileInput = document.getElementById('fileInput');
-    const uploadStatus = document.getElementById('uploadStatus');
-    const cidBox = document.getElementById('cidBox');
+<script>
+const uploadBtn = document.getElementById('uploadBtn');
+const fileInput = document.getElementById('fileInput');
+const uploadStatus = document.getElementById('uploadStatus');
+const cidBox = document.getElementById('cidBox');
 
-    const downloadBtn = document.getElementById('downloadBtn');
-    const cidInput = document.getElementById('cidInput');
-    const downloadStatus = document.getElementById('downloadStatus');
+const downloadBtn = document.getElementById('downloadBtn');
+const cidInput = document.getElementById('cidInput');
+const downloadStatus = document.getElementById('downloadStatus');
 
-    async function uploadFile() {
-      uploadStatus.textContent = '';
-      cidBox.textContent = '';
-      uploadStatus.className = 'status';
+async function uploadFile() {
+  uploadStatus.textContent = '';
+  cidBox.textContent = '';
+  uploadStatus.className = 'status';
 
-      const file = fileInput.files[0];
-      if (!file) {
-        uploadStatus.textContent = 'No file selected.';
-        uploadStatus.className = 'status err';
-        return;
-      }
+  const file = fileInput.files[0];
+  if (!file) {
+    uploadStatus.textContent = 'No file selected.';
+    uploadStatus.className = 'status err';
+    return;
+  }
 
-      uploadStatus.textContent = 'Uploading...';
-      try {
-        const resp = await fetch('/upload', {
-          method: 'POST',
-          headers: {
-            'X-Filename': encodeURIComponent(file.name)
-          },
-          body: file
-        });
+  uploadStatus.textContent = 'Uploading...';
 
-        if (!resp.ok) {
-          const text = await resp.text();
-          uploadStatus.textContent = 'Upload error: ' + text;
-          uploadStatus.className = 'status err';
-          return;
-        }
+  try {
+    const resp = await fetch('/upload', {
+      method: 'POST',
+      headers: {
+        'X-Filename': encodeURIComponent(file.name)
+      },
+      body: file
+    });
 
-        const data = await resp.json();
-        const cid = data.cid;
-        uploadStatus.textContent = 'Upload successful.';
-        uploadStatus.className = 'status ok';
-
-        cidBox.innerHTML = 'CID: <code>' + cid + '</code>';
-        cidInput.value = cid;
-      } catch (e) {
-        uploadStatus.textContent = 'Network or server error: ' + e;
-        uploadStatus.className = 'status err';
-      }
+    if (!resp.ok) {
+      uploadStatus.textContent = 'Upload failed.';
+      uploadStatus.className = 'status err';
+      return;
     }
 
-    function downloadFile() {
-      downloadStatus.textContent = '';
-      downloadStatus.className = 'status';
+    const data = await resp.json();
+    uploadStatus.textContent = 'Upload successful.';
+    uploadStatus.className = 'status ok';
+    cidBox.innerHTML = 'CID: <code>' + data.cid + '</code>';
+    cidInput.value = data.cid;
+  } catch (e) {
+    uploadStatus.textContent = 'Network error.';
+    uploadStatus.className = 'status err';
+  }
+}
 
-      const cid = cidInput.value.trim();
-      if (!cid) {
-        downloadStatus.textContent = 'Please enter a CID.';
-        downloadStatus.className = 'status err';
-        return;
-      }
+function downloadFile() {
+  downloadStatus.textContent = '';
+  downloadStatus.className = 'status';
 
-      // Normal navigation; server will set correct filename with Content-Disposition
-      const url = '/download?cid=' + encodeURIComponent(cid);
-      window.location.href = url;
+  const cid = cidInput.value.trim();
+  if (!cid) {
+    downloadStatus.textContent = 'Please enter a CID.';
+    downloadStatus.className = 'status err';
+    return;
+  }
 
-      downloadStatus.textContent = 'Download started.';
-      downloadStatus.className = 'status ok';
-    }
+  window.location.href = '/download?cid=' + encodeURIComponent(cid);
+  downloadStatus.textContent = 'Download started.';
+  downloadStatus.className = 'status ok';
+}
 
-    uploadBtn.addEventListener('click', uploadFile);
-    downloadBtn.addEventListener('click', downloadFile);
-  </script>
+uploadBtn.addEventListener('click', uploadFile);
+downloadBtn.addEventListener('click', downloadFile);
+</script>
 </body>
 </html>
 """
 
 
 def load_manifest(cid: str):
-    """
-    Load manifest JSON for a given CID from manifests/<cid>.json.
-    Returns dict or None on error.
-    """
-    manifest_path = os.path.join("manifests", cid + ".json")
+    path = os.path.join("manifests", cid + ".json")
     try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception as e:
-        print(f"[UI] Failed to load manifest for CID={cid}: {e}")
+    except Exception:
         return None
 
 
 class UIHandler(BaseHTTPRequestHandler):
-    server_version = "ContentEngineUI/0.2"
+    server_version = "ContentEngineUI/1.0"
 
     def do_GET(self):
         parsed = urlparse(self.path)
 
         # Serve UI
         if parsed.path == "/":
-            page_bytes = HTML_PAGE.encode("utf-8")
+            page = HTML_PAGE.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(page_bytes)))
+            self.send_header("Content-Length", str(len(page)))
             self.end_headers()
-            self.wfile.write(page_bytes)
+            self.wfile.write(page)
             return
 
-        # Proxy download → backend /download, but set filename from manifest
+        # DOWNLOAD (with strict CID validation)
         if parsed.path == "/download":
             qs = parse_qs(parsed.query)
             cid = qs.get("cid", [None])[0]
@@ -321,137 +255,101 @@ class UIHandler(BaseHTTPRequestHandler):
             cid = cid.strip()
             print(f"[UI] Download requested for CID={cid}")
 
+            # 🔴 THIS IS THE KEY FIX
             manifest = load_manifest(cid)
-            if manifest is not None:
-                filename = manifest.get("filename") or f"download_{cid[:8]}"
-                total_size = manifest.get("total_size")
-            else:
-                filename = f"download_{cid[:8]}"
-                total_size = None
+            if manifest is None:
+                self.send_error(404, "Invalid CID (manifest not found)")
+                return
 
-            # Contact backend
+            filename = manifest.get("filename") or f"download_{cid[:8]}"
+            total_size = manifest.get("total_size")
+
             try:
                 conn = http.client.HTTPConnection(BACKEND_HOST, BACKEND_PORT, timeout=20)
-                backend_path = f"/download?cid={cid}"
-                conn.request("GET", backend_path)
+                conn.request("GET", f"/download?cid={cid}")
                 resp = conn.getresponse()
             except Exception as e:
-                self.send_error(502, f"Error contacting backend: {e}")
+                self.send_error(502, f"Backend error: {e}")
                 return
 
             try:
                 if resp.status != 200:
                     body = resp.read()
                     self.send_response(resp.status)
-                    ctype = resp.getheader("Content-Type", "text/plain; charset=utf-8")
-                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Type", "text/plain")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
                     return
 
-                # Stream file back to browser with proper filename
                 self.send_response(200)
-                content_type = resp.getheader("Content-Type", "application/octet-stream")
-                self.send_header("Content-Type", content_type)
-
-                # Set filename from manifest (so browser saves with original name.ext)
-                # Basic ASCII-safe header; برای پروژه کافی است
+                self.send_header("Content-Type", "application/octet-stream")
                 safe_name = filename.replace('"', "_")
                 self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
 
-                # Optionally set Content-Length from manifest.total_size if available
-                if isinstance(total_size, int) and total_size >= 0:
+                if isinstance(total_size, int):
                     self.send_header("Content-Length", str(total_size))
 
                 self.end_headers()
 
-                total_sent = 0
-                chunk_size = 256 * 1024
                 while True:
-                    chunk = resp.read(chunk_size)
+                    chunk = resp.read(256 * 1024)
                     if not chunk:
                         break
                     self.wfile.write(chunk)
                     self.wfile.flush()
-                    total_sent += len(chunk)
-
-                print(f"[UI] Finished streaming CID={cid}, bytes_sent={total_sent}")
 
             finally:
                 conn.close()
             return
 
-        # Anything else
         self.send_error(404, "Not Found")
 
     def do_POST(self):
         parsed = urlparse(self.path)
 
-        # Proxy upload → backend /upload
         if parsed.path == "/upload":
             length = self.headers.get("Content-Length")
             fname = self.headers.get("X-Filename")
             if not length or not fname:
-                self.send_error(400, "Missing Content-Length or X-Filename")
+                self.send_error(400, "Missing headers")
                 return
 
-            try:
-                total = int(length)
-            except ValueError:
-                self.send_error(400, "Invalid Content-Length")
-                return
-
-            body = self.rfile.read(total)
-            if len(body) != total:
-                self.send_error(400, "Body shorter than Content-Length")
-                return
-
-            headers = {
-                "Content-Length": str(len(body)),
-                "Content-Type": "application/octet-stream",
-                "X-Filename": fname,
-            }
+            body = self.rfile.read(int(length))
 
             try:
                 conn = http.client.HTTPConnection(BACKEND_HOST, BACKEND_PORT, timeout=20)
-                conn.request("POST", "/upload", body=body, headers=headers)
+                conn.request("POST", "/upload", body=body, headers={
+                    "Content-Length": str(len(body)),
+                    "Content-Type": "application/octet-stream",
+                    "X-Filename": fname,
+                })
                 resp = conn.getresponse()
+                data = resp.read()
             except Exception as e:
-                self.send_error(502, f"Error contacting backend: {e}")
+                self.send_error(502, f"Backend error: {e}")
                 return
-
-            try:
-                backend_body = resp.read()
-                self.send_response(resp.status)
-                content_type = resp.getheader("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(backend_body)))
-                self.end_headers()
-                self.wfile.write(backend_body)
             finally:
                 conn.close()
+
+            self.send_response(resp.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
             return
 
         self.send_error(404, "Not Found")
 
     def log_message(self, fmt, *args):
-        print("%s - - [%s] %s" %
-              (self.client_address[0],
-               self.log_date_time_string(),
-               fmt % args))
+        print(fmt % args)
 
 
-def run_ui(host=UI_HOST, port=UI_PORT):
-    srv = ThreadingHTTPServer((host, port), UIHandler)
-    print(f"UI server listening on http://{host}:{port}")
+def run_ui():
+    srv = ThreadingHTTPServer((UI_HOST, UI_PORT), UIHandler)
+    print(f"UI server listening on http://{UI_HOST}:{UI_PORT}")
     print(f"Backend expected at http://{BACKEND_HOST}:{BACKEND_PORT}")
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        srv.server_close()
+    srv.serve_forever()
 
 
 if __name__ == "__main__":
